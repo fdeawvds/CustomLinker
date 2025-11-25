@@ -263,6 +263,7 @@ static int locate_eh_frame_ptr(struct csoloader_elf *img, void **out_ptr, size_t
   return -1;
 }
 
+/* TODO: Implement dl_iterate_eaidx */
 int custom_dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *), void *data) {
   /* INFO: Must be resolved via dl_iterate_phdr to ensure we don't enter 
              a loop, see our "hook" for dladdr in the code below. */

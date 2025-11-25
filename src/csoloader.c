@@ -100,6 +100,17 @@ bool csoloader_unload(struct csoloader *lib) {
   return true;
 }
 
+/* INFO: Free resources related to the library without unloading it */
+bool csoloader_abandon(struct csoloader *lib) {
+  linker_abandon(&lib->linker);
+
+  free(lib->lib_path);
+  
+  memset(lib, 0, sizeof(struct csoloader));
+
+  return true;
+}
+
 void *csoloader_get_symbol(struct csoloader *lib, const char *symbol_name) {
   return csoloader_elf_symb_address(lib->img, symbol_name);
 }

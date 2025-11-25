@@ -40,6 +40,8 @@ bool linker_init(struct linker *linker, struct csoloader_elf *img);
 
 void linker_destroy(struct linker *linker);
 
+void linker_abandon(struct linker *linker);
+
 bool linker_link(struct linker *linker);
 
 #endif /* LINKER_H */

@@ -302,6 +302,42 @@ void linker_destroy(struct linker *linker) {
   linker->main_map_size = 0;
 }
 
+/* INFO: Free resources related to the library without unloading it */
+void linker_abandon(struct linker *linker) {
+  for (int i = linker->dep_count - 1; i >= 0; --i) {
+    struct loaded_dep *dep = &linker->dependencies[i];
+    if (!dep->img) continue;
+
+    if (linker->is_linked && dep->is_manual_load) {
+      unregister_eh_frame_for_library(dep->img);
+      unregister_custom_library_for_backtrace(dep->img);
+    }
+
+    void *dep_base = dep->map_base;
+    size_t dep_map_size = dep->map_size;
+
+    csoloader_elf_destroy(dep->img);
+    dep->img = NULL;
+    dep->map_base = NULL;
+    dep->map_size = 0;
+  }
+
+  if (linker->img && linker->is_linked) {
+    unregister_eh_frame_for_library(linker->img);
+    unregister_custom_library_for_backtrace(linker->img);
+  }
+
+  void *main_base = linker->img->base;
+  size_t main_map_size = linker->main_map_size;
+
+  csoloader_elf_destroy(linker->img);
+  linker->img = NULL;
+
+  linker->dep_count = 0;
+  linker->is_linked = false;
+  linker->main_map_size = 0;
+}
+
 static size_t phdr_get_load_size(const ElfW(Phdr) *phdr, size_t length, ElfW(Addr) *min_vaddr) {
   ElfW(Addr) lo = UINTPTR_MAX, hi = 0;
   for (size_t i = 0; i < length; ++i) {

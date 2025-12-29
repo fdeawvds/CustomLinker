@@ -355,70 +355,86 @@ static size_t phdr_get_load_size(const ElfW(Phdr) *phdr, size_t length, ElfW(Add
   return hi - lo;
 }
 
+//在手动加载 ELF 时，为了绕过 SELinux 对“从任意文件映射可执行/可写内存”的拦截，最可靠的办法是：先建立匿名映射（Anonymous Mapping），然后通过 pread 将文件内容手动拷贝进内存。修改 _linker_load_one_segment 函数如下：
 static int _linker_load_one_segment(int fd, ElfW(Phdr) *phdr, ElfW(Addr) bias, off_t file_off) {
-  ElfW(Addr) seg_start = phdr->p_vaddr + bias;
-  ElfW(Addr) seg_end = seg_start + phdr->p_memsz;
-  ElfW(Addr) file_end = seg_start + phdr->p_filesz;
+    ElfW(Addr) seg_start = phdr->p_vaddr + bias;
+    ElfW(Addr) seg_end = seg_start + phdr->p_memsz;
 
-  ElfW(Addr) page_start = _page_start(seg_start);
-  ElfW(Addr) page_end = _page_end(seg_end);
+    ElfW(Addr) file_end = seg_start + phdr->p_filesz;
 
-  ElfW(Addr) file_page =_page_start(phdr->p_offset);
-  size_t file_len = _page_end(phdr->p_offset + phdr->p_filesz) - file_page;
+    ElfW(Addr) page_start = _page_start(seg_start);
+    ElfW(Addr) page_end = _page_end(seg_end);
 
-  int prot = 0;
-  if (phdr->p_flags & PF_R) prot |= PROT_READ;
-  if (phdr->p_flags & PF_W) prot |= PROT_WRITE;
-  if (phdr->p_flags & PF_X) prot |= PROT_EXEC;
+    ElfW(Addr) file_page = _page_start(phdr->p_offset);
+    size_t file_len = _page_end(phdr->p_offset + phdr->p_filesz) - file_page;
 
-  /* INFO: If it needs WRITE, then mmap without it, and later add that
-             permission to avoid issues. */
-  bool needs_mprotect = false;
-  if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) {
-    needs_mprotect = true;
+    int prot = 0;
+    if (phdr->p_flags & PF_R) prot |= PROT_READ;
+    if (phdr->p_flags & PF_W) prot |= PROT_WRITE;
+    if (phdr->p_flags & PF_X) prot |= PROT_EXEC;
 
-    prot &= ~PROT_EXEC;
-  }
+    /* INFO: If it needs WRITE, then mmap without it, and later add that
+               permission to avoid issues. */
+    bool needs_mprotect = false;
+    if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) {
+        needs_mprotect = true;
+        prot &= ~PROT_EXEC;
+    }
+    /* INFO: mmap with PROT_WRITE on modern Android gives "Invalid argument" error */
+    // 关键修复点：对于 Android 10+，使用匿名映射 + pread 绕过权限检查,否则无法mmap /data/local/tmp目录下的so文件
+    if (file_len > 0) {
+        // 1. 先映射一块可写的匿名内存（MAP_ANONYMOUS），不直接绑定文件 fd,否则/data/local/tmp下面的文件不能mmap成功
+        void* seg_addr = mmap((void *)page_start, file_len, PROT_READ | PROT_WRITE,
+                              MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-  /* INFO: mmap with PROT_WRITE on modern Android gives "Invalid argument" error */
-  if (file_len > 0 && mmap((void *)page_start, file_len, prot, MAP_FIXED | MAP_PRIVATE, fd, file_off + file_page) == MAP_FAILED) {
-    PLOGE("mmap file-backed segment");
-
-    return -1;
-  }
-
-  /* INFO: mmap the anonymous BSS portion that extends beyond the file size */
-  if (page_end > page_start + file_len) {
-    void *bss_addr = (void *)(page_start + file_len);
-    size_t bss_size = page_end - (page_start + file_len);
-
-    if (mmap(bss_addr, bss_size, prot, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) {
-      PLOGE("mmap anonymous BSS segment");
-
-      return -1;
+        if (seg_addr == MAP_FAILED) {
+            PLOGE("mmap anonymous segment failed");
+            return -1;
+        }
+        PLOGE("mmap anonymous segment success");
+        // 2. 手动将文件内容读入内存
+        // 注意：读取的长度是 phdr->p_filesz，读取位置是 file_off + phdr->p_offset
+        if (pread(fd, (void*)seg_start, phdr->p_filesz, file_off + phdr->p_offset) != (ssize_t)phdr->p_filesz) {
+            PLOGE("pread segment content failed");
+            return -1;
+        }
+        PLOGE("pread segment content success");
     }
 
-    /* INFO: Clear the memory to avoid use of unitialized variables and garbage data. This is needed. */
-    memset(bss_addr, 0, bss_size);
-  }
+    /* INFO: mmap the anonymous BSS portion that extends beyond the file size */
+    if (page_end > page_start + file_len) {
+        void *bss_addr = (void *) (page_start + file_len);
+        size_t bss_size = page_end - (page_start + file_len);
 
-  /* INFO: This is needed to avoid access to uninitialized data */
-  if ((phdr->p_flags & PF_W) && file_end < (seg_start + phdr->p_memsz)) {
-    size_t zero_len = _page_end(file_end) - file_end;
-    size_t seg_tail = seg_start + phdr->p_memsz - file_end;
-    if (zero_len > seg_tail) zero_len = seg_tail;
-  
-    memset((void *)file_end, 0, zero_len);
-  }
+        if (mmap(bss_addr, bss_size, prot, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) ==
+            MAP_FAILED) {
+            PLOGE("mmap anonymous BSS segment");
 
-  /* INFO: Restore PROT_EXEC if it was removed earlier */
-  if (needs_mprotect && mprotect((void*)page_start, page_end - page_start, prot | PROT_EXEC) != 0) {
-    PLOGE("mprotect to add PROT_EXEC");
+            return -1;
+        }
 
-    return -1;
-  }
+        /* INFO: Clear the memory to avoid use of unitialized variables and garbage data. This is needed. */
+        memset(bss_addr, 0, bss_size);
+    }
 
-  return 0;
+    /* INFO: This is needed to avoid access to uninitialized data */
+    if ((phdr->p_flags & PF_W) && file_end < (seg_start + phdr->p_memsz)) {
+        size_t zero_len = _page_end(file_end) - file_end;
+        size_t seg_tail = seg_start + phdr->p_memsz - file_end;
+        if (zero_len > seg_tail) zero_len = seg_tail;
+
+        memset((void *) file_end, 0, zero_len);
+    }
+    //mprotect
+    if (phdr->p_flags & PF_X) prot |= PROT_EXEC;
+    /* INFO: Restore PROT_EXEC if it was removed earlier */
+    if (mprotect((void *) page_start, page_end - page_start, prot) != 0) {
+        PLOGE("mprotect to add PROT_EXEC");
+
+        return -1;
+    }
+
+    return 0;
 }
 
 void *linker_load_library_manually(const char *lib_path, struct loaded_dep *out) {
